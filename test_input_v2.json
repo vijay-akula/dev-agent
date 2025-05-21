@@ -1,0 +1,8 @@
+{
+  "command": "explain this code",
+  "command_type": "explain",
+  "file_content": "def hello_world():\n    print('Hello, world!')\n\nif __name__ == '__main__':\n    hello_world()",
+  "file_path": "hello.py",
+  "prompt": "explain this code",
+  "input": "def hello_world():\n    print('Hello, world!')\n\nif __name__ == '__main__':\n    hello_world()"
+}

@@ -1,0 +1,180 @@
+{
+  "name": "dev-agent",
+  "displayName": "Dev Agent",
+  "description": "A VS Code extension similar to GitHub Copilot Chat that executes Python scripts and displays responses",
+  "version": "0.0.4",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openhands/dev-agent"
+  },
+  "publisher": "dev-agent",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "python",
+    "agent",
+    "copilot",
+    "ai",
+    "code execution"
+  ],
+  "icon": "media/icon.png",
+  "activationEvents": [
+    "onView:dev-agent-chat-panel",
+    "onCommand:dev-agent.startChat",
+    "onCommand:dev-agent.start",
+    "onCommand:dev-agent.processAtMention",
+    "onCommand:dev-agent.detectAtMention",
+    "onCommand:dev-agent.processCurrentFile",
+    "onCommand:dev-agent.uploadFile"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Dev Agent",
+      "properties": {
+        "dev-agent.scriptPath": {
+          "type": "string",
+          "default": "agent_v2.py",
+          "description": "Path to the agent script. Can be absolute or relative to workspace."
+        },
+        "dev-agent.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to the Python executable."
+        },
+        "dev-agent.additionalArgs": {
+          "type": "string",
+          "default": "",
+          "description": "Additional arguments to pass to the agent.py script."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "dev-agent.startChat",
+        "title": "Dev Agent: Start Chat"
+      },
+      {
+        "command": "dev-agent.start",
+        "title": "Start Dev Agent"
+      },
+      {
+        "command": "dev-agent.processAtMention",
+        "title": "Dev Agent: Process @dev-agent Mention"
+      },
+      {
+        "command": "dev-agent.detectAtMention",
+        "title": "Dev Agent: Detect @dev-agent Mentions"
+      },
+      {
+        "command": "dev-agent.processCurrentFile",
+        "title": "Dev Agent: Process Current File"
+      },
+      {
+        "command": "dev-agent.uploadFile",
+        "title": "Dev Agent: Upload and Process File"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "dev-agent-panel",
+          "title": "Dev Agent",
+          "icon": "media/icon.png"
+        }
+      ]
+    },
+    "views": {
+      "dev-agent-panel": [
+        {
+          "id": "dev-agent-chat-panel",
+          "name": "Chat",
+          "type": "webview"
+        }
+      ]
+    },
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "dev-agent.startChat",
+          "group": "dev-agent"
+        },
+        {
+          "command": "dev-agent.processAtMention",
+          "group": "dev-agent"
+        },
+        {
+          "command": "dev-agent.processCurrentFile",
+          "group": "dev-agent"
+        },
+        {
+          "command": "dev-agent.uploadFile",
+          "group": "dev-agent"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "dev-agent.processAtMention",
+          "group": "dev-agent",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "dev-agent.processCurrentFile",
+          "group": "dev-agent"
+        },
+        {
+          "command": "dev-agent.uploadFile",
+          "group": "dev-agent"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "dev-agent.startChat",
+        "key": "ctrl+shift+d",
+        "mac": "cmd+shift+d",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "dev-agent.processCurrentFile",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a",
+        "when": "editorTextFocus"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "build": "npm run lint && npm run compile && npm run package",
+    "package-extension": "node ./package-extension.js"
+  },
+  "devDependencies": {
+    "@types/glob": "^8.1.0",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "16.x",
+    "@types/sinon": "^17.0.4",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^5.59.1",
+    "@typescript-eslint/parser": "^5.59.1",
+    "@vscode/test-electron": "^2.3.0",
+    "@vscode/vsce": "^3.4.1",
+    "eslint": "^8.39.0",
+    "glob": "^8.1.0",
+    "mocha": "^10.2.0",
+    "sinon": "^20.0.0",
+    "typescript": "^5.0.4"
+  }
+}

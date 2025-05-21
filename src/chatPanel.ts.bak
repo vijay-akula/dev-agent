@@ -1,0 +1,909 @@
+import * as vscode from 'vscode';
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import { exec, spawn } from 'child_process';
+import { promisify } from 'util';
+
+const execPromise = promisify(exec);
+
+export class ChatPanel {
+  public static currentPanel: ChatPanel | undefined;
+  private readonly _panel: vscode.WebviewPanel;
+  private readonly _extensionUri: vscode.Uri;
+  private _disposables: vscode.Disposable[] = [];
+  private _chatHistory: Array<{role: 'user' | 'agent', content: string}> = [];
+
+  public static createOrShow(extensionUri: vscode.Uri) {
+    const column = vscode.window.activeTextEditor
+      ? vscode.window.activeTextEditor.viewColumn
+      : undefined;
+
+    // If we already have a panel, show it
+    if (ChatPanel.currentPanel) {
+      ChatPanel.currentPanel._panel.reveal(column);
+      return;
+    }
+
+    // Otherwise, create a new panel
+    const panel = vscode.window.createWebviewPanel(
+      'devAgentChat',
+      'Dev Agent Chat',
+      column || vscode.ViewColumn.One,
+      {
+        enableScripts: true,
+        retainContextWhenHidden: true,
+        localResourceRoots: [
+          vscode.Uri.joinPath(extensionUri, 'media'),
+          vscode.Uri.joinPath(extensionUri, 'out')
+        ]
+      }
+    );
+
+    ChatPanel.currentPanel = new ChatPanel(panel, extensionUri);
+  }
+
+  private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
+    this._panel = panel;
+    this._extensionUri = extensionUri;
+
+    // Add initial welcome message to chat history
+    this._chatHistory.push({
+      role: 'agent',
+      content: 'Hello! I\'m Dev Agent. You can send me commands or use @dev-agent in your code files.'
+    });
+
+    // Set the webview's initial html content
+    this._update();
+
+    // Listen for when the panel is disposed
+    // This happens when the user closes the panel or when the panel is closed programmatically
+    this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
+
+    // Update the content based on view changes
+    this._panel.onDidChangeViewState(
+      e => {
+        if (this._panel.visible) {
+          this._update();
+        }
+      },
+      null,
+      this._disposables
+    );
+
+    // Handle messages from the webview
+    this._panel.webview.onDidReceiveMessage(
+      async (message) => {
+        switch (message.command) {
+          case 'executeCode':
+            // Add user message to chat history
+            this._chatHistory.push({
+              role: 'user',
+              content: message.code
+            });
+
+            try {
+              // Show loading indicator
+              this._panel.webview.postMessage({ 
+                command: 'loading', 
+                isLoading: true 
+              });
+
+              const result = await this.executeCode(message.code);
+              
+              // Add agent response to chat history
+              this._chatHistory.push({
+                role: 'agent',
+                content: result
+              });
+
+              // Send result to webview
+              this._panel.webview.postMessage({ 
+                command: 'result', 
+                result: result,
+                isLoading: false
+              });
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              
+              // Add error to chat history
+              this._chatHistory.push({
+                role: 'agent',
+                content: `Error: ${errorMessage}`
+              });
+
+              this._panel.webview.postMessage({ 
+                command: 'error', 
+                error: errorMessage,
+                isLoading: false
+              });
+            }
+            return;
+          
+          case 'clearChat':
+            this._chatHistory = [{
+              role: 'agent',
+              content: 'Chat history cleared. What would you like to do next?'
+            }];
+            this._panel.webview.postMessage({ 
+              command: 'chatCleared'
+            });
+            return;
+            
+          case 'runAgentCommand':
+            try {
+              // Show loading indicator
+              this._panel.webview.postMessage({ 
+                command: 'loading', 
+                isLoading: true 
+              });
+              
+              // Add user message to chat history
+              this._chatHistory.push({
+                role: 'user',
+                content: message.userCommand
+              });
+              
+              const result = await this.runAgentScript(
+                message.userCommand,
+                message.commandType,
+                message.fileContent,
+                message.filePath
+              );
+              
+              // Add agent response to chat history
+              this._chatHistory.push({
+                role: 'agent',
+                content: result
+              });
+              
+              // Send result to webview
+              this._panel.webview.postMessage({ 
+                command: 'result', 
+                result: result,
+                isLoading: false
+              });
+            } catch (error) {
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              
+              // Add error to chat history
+              this._chatHistory.push({
+                role: 'agent',
+                content: `Error: ${errorMessage}`
+              });
+              
+              this._panel.webview.postMessage({ 
+                command: 'error', 
+                error: errorMessage,
+                isLoading: false
+              });
+            }
+            return;
+        }
+      },
+      null,
+      this._disposables
+    );
+  }
+  
+  public async processAtMention(command: string, fileContent: string, filePath: string) {
+    try {
+      // Add user message to chat history
+      const userMessage = `@dev-agent ${command}`;
+      this._chatHistory.push({
+        role: 'user',
+        content: userMessage
+      });
+      
+      // Update the webview to show the new message
+      this._update();
+      
+      // Show loading indicator
+      this._panel.webview.postMessage({ 
+        command: 'loading', 
+        isLoading: true 
+      });
+      
+      // Determine command type
+      let commandType = 'custom';
+      if (command.toLowerCase().includes('pseudo code')) {
+        commandType = 'pseudo_code';
+      } else if (command.toLowerCase().includes('explain')) {
+        commandType = 'explain';
+      }
+      
+      // Run the agent script
+      const result = await this.runAgentScript(command, commandType, fileContent, filePath);
+      
+      // Add agent response to chat history
+      this._chatHistory.push({
+        role: 'agent',
+        content: result
+      });
+      
+      // Send result to webview
+      this._panel.webview.postMessage({ 
+        command: 'result', 
+        result: result,
+        isLoading: false
+      });
+      
+      // Update the webview
+      this._update();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Add error to chat history
+      this._chatHistory.push({
+        role: 'agent',
+        content: `Error: ${errorMessage}`
+      });
+      
+      this._panel.webview.postMessage({ 
+        command: 'error', 
+        error: errorMessage,
+        isLoading: false
+      });
+      
+      // Update the webview
+      this._update();
+    }
+  }
+
+  private async executeCode(code: string): Promise<string> {
+    // Create a temporary Python file
+    const tempDir = path.join(os.tmpdir(), 'dev-agent');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    const tempFile = path.join(tempDir, `script_${Date.now()}.py`);
+    fs.writeFileSync(tempFile, code);
+    
+    try {
+      // Set a timeout for execution (10 seconds)
+      const timeoutMs = 10000;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('Execution timed out after 10 seconds')), timeoutMs);
+      });
+      
+      // Execute the Python script with timeout
+      const execPromiseWithTimeout = Promise.race([
+        execPromise(`python "${tempFile}"`),
+        timeoutPromise
+      ]);
+      
+      const { stdout, stderr } = await execPromiseWithTimeout as { stdout: string, stderr: string };
+      
+      if (stderr) {
+        return `Error: ${stderr}\n\nOutput: ${stdout}`;
+      }
+      
+      return stdout || 'Script executed successfully with no output.';
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('timed out')) {
+        throw error;
+      }
+      throw new Error(`Failed to execute Python script: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      // Clean up the temporary file
+      try {
+        fs.unlinkSync(tempFile);
+      } catch (error) {
+        console.error('Failed to delete temporary file:', error);
+      }
+    }
+  }
+  
+  private async runAgentScript(
+    userCommand: string, 
+    commandType: string, 
+    fileContent: string, 
+    filePath: string
+  ): Promise<string> {
+    // Get the path to the agent.py script
+    const extensionPath = vscode.extensions.getExtension('dev-agent.dev-agent')?.extensionPath || 
+                          path.dirname(this._extensionUri.fsPath);
+    const agentScriptPath = path.join(extensionPath, 'scripts', 'agent.py');
+    
+    // Check if the agent script exists
+    if (!fs.existsSync(agentScriptPath)) {
+      throw new Error(`Agent script not found at ${agentScriptPath}`);
+    }
+    
+    // Create a temporary file for the request data
+    const tempDir = path.join(os.tmpdir(), 'dev-agent');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    
+    const tempFile = path.join(tempDir, `request_${Date.now()}.json`);
+    
+    // Create the request data
+    const requestData = {
+      command: commandType,
+      content: userCommand,
+      fileContent: fileContent,
+      filePath: filePath
+    };
+    
+    // Write the request data to the temporary file
+    fs.writeFileSync(tempFile, JSON.stringify(requestData, null, 2));
+    
+    try {
+      // Set a timeout for execution (30 seconds)
+      const timeoutMs = 30000;
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('Agent script execution timed out after 30 seconds')), timeoutMs);
+      });
+      
+      // Execute the agent script with timeout
+      const execPromiseWithTimeout = Promise.race([
+        execPromise(`python "${agentScriptPath}" --input-file "${tempFile}"`),
+        timeoutPromise
+      ]);
+      
+      const { stdout, stderr } = await execPromiseWithTimeout as { stdout: string, stderr: string };
+      
+      if (stderr) {
+        console.error('Agent script stderr:', stderr);
+      }
+      
+      return stdout || 'Agent script executed successfully with no output.';
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('timed out')) {
+        throw error;
+      }
+      throw new Error(`Failed to execute agent script: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      // Clean up the temporary file
+      try {
+        fs.unlinkSync(tempFile);
+      } catch (error) {
+        console.error('Failed to delete temporary file:', error);
+      }
+    }
+  }
+
+  public dispose() {
+    ChatPanel.currentPanel = undefined;
+
+    // Clean up our resources
+    this._panel.dispose();
+
+    while (this._disposables.length) {
+      const x = this._disposables.pop();
+      if (x) {
+        x.dispose();
+      }
+    }
+  }
+
+  private _update() {
+    const webview = this._panel.webview;
+    this._panel.title = "Dev Agent Chat";
+    this._panel.webview.html = this._getHtmlForWebview(webview);
+  }
+
+  private _getHtmlForWebview(webview: vscode.Webview) {
+    return `<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Dev Agent Chat</title>
+        <style>
+            body {
+                font-family: var(--vscode-font-family);
+                padding: 0;
+                margin: 0;
+                color: var(--vscode-foreground);
+                background-color: var(--vscode-editor-background);
+                display: flex;
+                flex-direction: column;
+                height: 100vh;
+            }
+            #header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 8px 16px;
+                background-color: var(--vscode-editor-background);
+                border-bottom: 1px solid var(--vscode-panel-border);
+            }
+            #header-title {
+                font-size: 14px;
+                font-weight: bold;
+            }
+            #header-actions {
+                display: flex;
+                gap: 8px;
+            }
+            .header-button {
+                background: none;
+                border: none;
+                color: var(--vscode-button-foreground);
+                cursor: pointer;
+                padding: 4px 8px;
+                font-size: 12px;
+                border-radius: 4px;
+                background-color: var(--vscode-button-background);
+            }
+            .header-button:hover {
+                background-color: var(--vscode-button-hoverBackground);
+            }
+            #chat-container {
+                flex: 1;
+                overflow-y: auto;
+                padding: 16px;
+                display: flex;
+                flex-direction: column;
+                gap: 16px;
+            }
+            .message-container {
+                display: flex;
+                flex-direction: column;
+                max-width: 90%;
+            }
+            .message-container.user {
+                align-self: flex-end;
+            }
+            .message-container.agent {
+                align-self: flex-start;
+            }
+            .message-header {
+                display: flex;
+                align-items: center;
+                margin-bottom: 4px;
+                font-size: 12px;
+                color: var(--vscode-descriptionForeground);
+            }
+            .message-avatar {
+                width: 24px;
+                height: 24px;
+                border-radius: 50%;
+                margin-right: 8px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            .user-avatar {
+                background-color: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+            }
+            .agent-avatar {
+                background-color: var(--vscode-activityBarBadge-background);
+                color: var(--vscode-activityBarBadge-foreground);
+            }
+            .message {
+                padding: 12px;
+                border-radius: 8px;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
+                max-width: 100%;
+            }
+            .user-message {
+                background-color: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+            }
+            .agent-message {
+                background-color: var(--vscode-editor-inactiveSelectionBackground);
+                color: var(--vscode-foreground);
+            }
+            .code-block {
+                background-color: var(--vscode-textCodeBlock-background);
+                padding: 12px;
+                border-radius: 6px;
+                font-family: var(--vscode-editor-font-family), monospace;
+                font-size: var(--vscode-editor-font-size);
+                white-space: pre-wrap;
+                margin: 8px 0;
+                overflow-x: auto;
+            }
+            #input-container {
+                display: flex;
+                flex-direction: column;
+                padding: 16px;
+                border-top: 1px solid var(--vscode-panel-border);
+                background-color: var(--vscode-editor-background);
+            }
+            #message-input {
+                padding: 12px;
+                border: 1px solid var(--vscode-input-border);
+                background-color: var(--vscode-input-background);
+                color: var(--vscode-input-foreground);
+                border-radius: 6px;
+                resize: none;
+                min-height: 80px;
+                max-height: 200px;
+                overflow-y: auto;
+                font-family: var(--vscode-editor-font-family), monospace;
+                font-size: var(--vscode-editor-font-size);
+                margin-bottom: 8px;
+            }
+            #input-actions {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            #input-hint {
+                font-size: 12px;
+                color: var(--vscode-descriptionForeground);
+            }
+            #send-button {
+                padding: 8px 16px;
+                background-color: var(--vscode-button-background);
+                color: var(--vscode-button-foreground);
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-weight: 500;
+            }
+            #send-button:hover {
+                background-color: var(--vscode-button-hoverBackground);
+            }
+            #send-button:disabled {
+                opacity: 0.5;
+                cursor: not-allowed;
+            }
+            .loading-indicator {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 16px;
+                color: var(--vscode-descriptionForeground);
+            }
+            .loading-spinner {
+                width: 16px;
+                height: 16px;
+                border: 2px solid var(--vscode-descriptionForeground);
+                border-radius: 50%;
+                border-top-color: transparent;
+                animation: spin 1s linear infinite;
+                margin-right: 8px;
+            }
+            @keyframes spin {
+                to { transform: rotate(360deg); }
+            }
+            .output-container {
+                background-color: var(--vscode-terminal-background);
+                color: var(--vscode-terminal-foreground);
+                padding: 12px;
+                border-radius: 6px;
+                font-family: var(--vscode-editor-font-family), monospace;
+                font-size: var(--vscode-editor-font-size);
+                white-space: pre-wrap;
+                overflow-x: auto;
+            }
+            .error-output {
+                color: var(--vscode-errorForeground);
+            }
+            .markdown-content {
+                line-height: 1.5;
+            }
+            .markdown-content h1, .markdown-content h2, .markdown-content h3 {
+                margin-top: 16px;
+                margin-bottom: 8px;
+                font-weight: 600;
+            }
+            .markdown-content p {
+                margin-top: 8px;
+                margin-bottom: 8px;
+            }
+            .markdown-content ul, .markdown-content ol {
+                margin-top: 8px;
+                margin-bottom: 8px;
+                padding-left: 24px;
+            }
+            .markdown-content pre {
+                background-color: var(--vscode-textCodeBlock-background);
+                padding: 12px;
+                border-radius: 6px;
+                overflow-x: auto;
+                margin: 8px 0;
+            }
+            .markdown-content code {
+                font-family: var(--vscode-editor-font-family), monospace;
+                font-size: var(--vscode-editor-font-size);
+                background-color: var(--vscode-textCodeBlock-background);
+                padding: 2px 4px;
+                border-radius: 3px;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="header">
+            <div id="header-title">Dev Agent</div>
+            <div id="header-actions">
+                <button id="clear-chat" class="header-button">Clear Chat</button>
+            </div>
+        </div>
+        <div id="chat-container">
+            ${this._chatHistory.map(msg => `
+                <div class="message-container ${msg.role}">
+                    <div class="message-header">
+                        <div class="message-avatar ${msg.role}-avatar">${msg.role === 'user' ? 'U' : 'D'}</div>
+                        <div>${msg.role === 'user' ? 'You' : 'Dev Agent'}</div>
+                    </div>
+                    <div class="message ${msg.role}-message">
+                        ${msg.role === 'user' 
+                            ? `<div class="code-block">${this._escapeHtml(msg.content)}</div>` 
+                            : this._formatOutput(msg.content)}
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+        <div id="loading-container" class="loading-indicator" style="display: none;">
+            <div class="loading-spinner"></div>
+            <div>Processing request...</div>
+        </div>
+        <div id="input-container">
+            <textarea id="message-input" placeholder="Type your command or Python code here..."></textarea>
+            <div id="input-actions">
+                <div id="input-hint">Shift+Enter for new line, Enter to send</div>
+                <button id="send-button">Execute</button>
+            </div>
+        </div>
+
+        <script>
+            const vscode = acquireVsCodeApi();
+            const chatContainer = document.getElementById('chat-container');
+            const messageInput = document.getElementById('message-input');
+            const sendButton = document.getElementById('send-button');
+            const clearChatButton = document.getElementById('clear-chat');
+            const loadingContainer = document.getElementById('loading-container');
+            
+            // Focus the input field when the webview loads
+            messageInput.focus();
+
+            // Handle sending messages
+            function sendMessage() {
+                const text = messageInput.value.trim();
+                if (!text) return;
+
+                // Check if this is a command for the agent
+                if (text.startsWith('@dev-agent')) {
+                    // Extract the command
+                    const command = text.substring('@dev-agent'.length).trim();
+                    
+                    // Add user message to chat
+                    addMessage(text, 'user');
+                    
+                    // Send command to extension
+                    vscode.postMessage({
+                        command: 'runAgentCommand',
+                        userCommand: command,
+                        commandType: determineCommandType(command),
+                        fileContent: '',  // No file content when sending from chat
+                        filePath: ''      // No file path when sending from chat
+                    });
+                } else {
+                    // Treat as Python code
+                    addMessage(text, 'user');
+                    
+                    // Send code to extension for execution
+                    vscode.postMessage({
+                        command: 'executeCode',
+                        code: text
+                    });
+                }
+                
+                // Clear input
+                messageInput.value = '';
+                
+                // Disable send button during execution
+                sendButton.disabled = true;
+                
+                // Show loading indicator
+                loadingContainer.style.display = 'flex';
+            }
+            
+            // Determine the command type based on the user's input
+            function determineCommandType(command) {
+                if (command.toLowerCase().includes('pseudo code')) {
+                    return 'pseudo_code';
+                } else if (command.toLowerCase().includes('explain')) {
+                    return 'explain';
+                } else {
+                    return 'custom';
+                }
+            }
+
+            // Add a message to the chat
+            function addMessage(content, role) {
+                const messageContainer = document.createElement('div');
+                messageContainer.className = `message-container \${role}`;
+                
+                const messageHeader = document.createElement('div');
+                messageHeader.className = 'message-header';
+                
+                const avatar = document.createElement('div');
+                avatar.className = `message-avatar \${role}-avatar`;
+                avatar.textContent = role === 'user' ? 'U' : 'D';
+                
+                const name = document.createElement('div');
+                name.textContent = role === 'user' ? 'You' : 'Dev Agent';
+                
+                messageHeader.appendChild(avatar);
+                messageHeader.appendChild(name);
+                
+                const messageDiv = document.createElement('div');
+                messageDiv.className = `message \${role}-message`;
+                
+                if (role === 'user') {
+                    const codeBlock = document.createElement('div');
+                    codeBlock.className = 'code-block';
+                    codeBlock.textContent = content;
+                    messageDiv.appendChild(codeBlock);
+                } else {
+                    // Format the output for agent messages
+                    messageDiv.innerHTML = formatOutput(content);
+                }
+                
+                messageContainer.appendChild(messageHeader);
+                messageContainer.appendChild(messageDiv);
+                
+                chatContainer.appendChild(messageContainer);
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+            }
+
+            // Format the output to handle code blocks and plain text
+            function formatOutput(text) {
+                // Check if the text contains error message
+                if (text.startsWith('Error:')) {
+                    return `<div class="output-container error-output">${escapeHtml(text)}</div>`;
+                }
+                
+                // Check if the text contains markdown
+                if (text.includes('#') || text.includes('```')) {
+                    return `<div class="markdown-content">${formatMarkdown(text)}</div>`;
+                }
+                
+                // For regular output
+                return `<div class="output-container">${escapeHtml(text)}</div>`;
+            }
+            
+            // Simple markdown formatter
+            function formatMarkdown(text) {
+                // Replace code blocks
+                let formatted = text.replace(/```([\\s\\S]*?)```/g, '<pre><code>$1</code></pre>');
+                
+                // Replace inline code
+                formatted = formatted.replace(/`([^`]+)`/g, '<code>$1</code>');
+                
+                // Replace headers
+                formatted = formatted.replace(/^# (.*$)/gm, '<h1>$1</h1>');
+                formatted = formatted.replace(/^## (.*$)/gm, '<h2>$1</h2>');
+                formatted = formatted.replace(/^### (.*$)/gm, '<h3>$1</h3>');
+                
+                // Replace lists
+                formatted = formatted.replace(/^\\s*\\* (.*$)/gm, '<ul><li>$1</li></ul>');
+                formatted = formatted.replace(/^\\s*\\d+\\. (.*$)/gm, '<ol><li>$1</li></ol>');
+                
+                // Replace paragraphs
+                formatted = formatted.replace(/^(?!<[h|u|o|p|c])(.*$)/gm, '<p>$1</p>');
+                
+                // Fix nested lists
+                formatted = formatted.replace(/<\\/ul>\\s*<ul>/g, '');
+                formatted = formatted.replace(/<\\/ol>\\s*<ol>/g, '');
+                
+                return formatted;
+            }
+
+            // Escape HTML to prevent XSS
+            function escapeHtml(unsafe) {
+                return unsafe
+                    .replace(/&/g, "&amp;")
+                    .replace(/</g, "&lt;")
+                    .replace(/>/g, "&gt;")
+                    .replace(/"/g, "&quot;")
+                    .replace(/'/g, "&#039;");
+            }
+
+            // Clear chat history
+            clearChatButton.addEventListener('click', () => {
+                vscode.postMessage({
+                    command: 'clearChat'
+                });
+            });
+
+            // Event listeners
+            sendButton.addEventListener('click', sendMessage);
+            messageInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    sendMessage();
+                }
+            });
+
+            // Handle messages from the extension
+            window.addEventListener('message', event => {
+                const message = event.data;
+                switch (message.command) {
+                    case 'result':
+                        // Hide loading indicator
+                        loadingContainer.style.display = 'none';
+                        // Enable send button
+                        sendButton.disabled = false;
+                        // Add result to chat
+                        addMessage(message.result, 'agent');
+                        break;
+                    case 'error':
+                        // Hide loading indicator
+                        loadingContainer.style.display = 'none';
+                        // Enable send button
+                        sendButton.disabled = false;
+                        // Add error to chat
+                        addMessage(`Error: \${message.error}`, 'agent');
+                        break;
+                    case 'loading':
+                        // Show/hide loading indicator
+                        loadingContainer.style.display = message.isLoading ? 'flex' : 'none';
+                        // Enable/disable send button
+                        sendButton.disabled = message.isLoading;
+                        break;
+                    case 'chatCleared':
+                        // Clear chat container
+                        chatContainer.innerHTML = '';
+                        // Add welcome message
+                        addMessage('Chat history cleared. What would you like to do next?', 'agent');
+                        break;
+                }
+            });
+        </script>
+    </body>
+    </html>`;
+  }
+  
+  private _escapeHtml(unsafe: string): string {
+    return unsafe
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+  
+  private _formatOutput(content: string): string {
+    // Check if the content contains error message
+    if (content.startsWith('Error:')) {
+      return `<div class="output-container error-output">${this._escapeHtml(content)}</div>`;
+    }
+    
+    // Check if the content contains markdown
+    if (content.includes('#') || content.includes('```')) {
+      return `<div class="markdown-content">${this._formatMarkdown(content)}</div>`;
+    }
+    
+    // For regular output
+    return `<div class="output-container">${this._escapeHtml(content)}</div>`;
+  }
+  
+  private _formatMarkdown(text: string): string {
+    // Replace code blocks
+    let formatted = text.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
+    
+    // Replace inline code
+    formatted = formatted.replace(/`([^`]+)`/g, '<code>$1</code>');
+    
+    // Replace headers
+    formatted = formatted.replace(/^# (.*$)/gm, '<h1>$1</h1>');
+    formatted = formatted.replace(/^## (.*$)/gm, '<h2>$1</h2>');
+    formatted = formatted.replace(/^### (.*$)/gm, '<h3>$1</h3>');
+    
+    // Replace lists
+    formatted = formatted.replace(/^\s*\* (.*$)/gm, '<ul><li>$1</li></ul>');
+    formatted = formatted.replace(/^\s*\d+\. (.*$)/gm, '<ol><li>$1</li></ol>');
+    
+    // Replace paragraphs
+    formatted = formatted.replace(/^(?!<[h|u|o|p|c])(.*$)/gm, '<p>$1</p>');
+    
+    // Fix nested lists
+    formatted = formatted.replace(/<\/ul>\s*<ul>/g, '');
+    formatted = formatted.replace(/<\/ol>\s*<ol>/g, '');
+    
+    return formatted;
+  }
+}
