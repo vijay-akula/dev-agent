@@ -9,6 +9,7 @@ import json
 import sys
 import os
 import traceback
+import subprocess
 from datetime import datetime
 
 def parse_arguments():
@@ -24,6 +25,8 @@ def process_command(command, file_content, file_path=None, command_type=None):
         return explain_code(file_content, file_path)
     elif command_type == "pseudo_code":
         return generate_pseudo_code(file_content, file_path)
+    elif command_type == "workflow":
+        return execute_workflow(command, file_content, file_path)
     elif command.lower().startswith("explain"):
         return explain_code(file_content, file_path)
     elif command.lower().startswith("pseudo code") or command.lower().startswith("provide pseudo"):
@@ -32,6 +35,8 @@ def process_command(command, file_content, file_path=None, command_type=None):
         return summarize_file(file_content, file_path)
     elif command.lower().startswith("execute"):
         return execute_code(file_content)
+    elif command.lower().startswith("workflow"):
+        return execute_workflow(command, file_content, file_path)
     else:
         return process_custom_command(command, file_content, file_path)
 
@@ -83,6 +88,115 @@ def summarize_file(content, file_path=None):
 
 ## Structure
 {get_file_structure(content, file_path)}
+"""
+
+def execute_workflow(command, file_content, file_path=None):
+    """Execute a workflow using the workflow_engine/orchestrator.py script."""
+    try:
+        # Extract workflow name from command
+        workflow_name = command.lower().replace("workflow", "").strip()
+        if not workflow_name:
+            workflow_name = "default"
+        
+        # Create a temporary input file for the workflow
+        temp_input_file = f"/tmp/workflow_input_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        temp_output_file = f"/tmp/workflow_output_{datetime.now().strftime('%Y%m%d%H%M%S')}.json"
+        
+        # Prepare input data
+        input_data = {
+            "command": command,
+            "file_content": file_content,
+            "file_path": file_path,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Write input data to the temporary file
+        with open(temp_input_file, 'w') as f:
+            json.dump(input_data, f, indent=2)
+        
+        # Construct the command to execute the orchestrator.py script
+        # Use the workflow_engine's virtual environment
+        orchestrator_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflow_engine/orchestrator.py")
+        venv_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflow_engine/venv/bin/python")
+        
+        # Execute the orchestrator.py script
+        import subprocess
+        cmd = [
+            venv_python, 
+            orchestrator_path, 
+            "--input-file", temp_input_file,
+            "--output-file", temp_output_file,
+            "--workflow", workflow_name,
+            "--verbose"
+        ]
+        
+        process = subprocess.run(cmd, capture_output=True, text=True)
+        
+        # Read the output file
+        if os.path.exists(temp_output_file):
+            with open(temp_output_file, 'r') as f:
+                result = json.load(f)
+        else:
+            result = {
+                "status": "error",
+                "message": "Output file not created",
+                "stdout": process.stdout,
+                "stderr": process.stderr
+            }
+        
+        # Clean up temporary files
+        if os.path.exists(temp_input_file):
+            os.remove(temp_input_file)
+        if os.path.exists(temp_output_file):
+            os.remove(temp_output_file)
+        
+        # Format the response
+        if process.returncode != 0 or result.get("status") == "error":
+            return f"""
+# Workflow Execution Error
+
+## Error
+```
+{process.stderr or result.get("message", "Unknown error")}
+```
+
+## Command
+```
+{' '.join(cmd)}
+```
+
+## Input
+```json
+{json.dumps(input_data, indent=2)}
+```
+"""
+        else:
+            return f"""
+# Workflow Execution Result
+
+## Output
+```json
+{json.dumps(result, indent=2)}
+```
+
+## Workflow
+{workflow_name}
+
+## Command
+```
+{' '.join(cmd)}
+```
+"""
+    except Exception as e:
+        return f"""
+# Workflow Execution Error
+
+```
+{traceback.format_exc()}
+```
+
+## Command
+{command}
 """
 
 def execute_code(code):
