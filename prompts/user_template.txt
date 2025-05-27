@@ -1,0 +1,1 @@
+Explain the following TAL code. Insert comments into the code as appropriate before each relevant line or block, not at the end of lines. {input_content}

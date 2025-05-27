@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import { exec, spawn } from 'child_process';
 import { promisify } from 'util';
+import { callAgentApi, formatApiResponse, ApiResponse } from './apiClient';
 
 const execPromise = promisify(exec);
 
@@ -75,6 +76,9 @@ export class ChatPanel {
             break;
           case 'execute':
             await this.handleExecuteCommand(message);
+            break;
+          case 'callApi':
+            await this.handleApiCall(message);
             break;
           case 'executeCode':
             // Get the current file content if available
@@ -216,6 +220,78 @@ export class ChatPanel {
     );
   }
 
+  private async handleApiCall(message: any) {
+    const prompt = message.prompt;
+    const isDevAgentCommand = message.isDevAgentCommand;
+    
+    // Add user message to chat history
+    this._chatHistory.push({
+      role: 'user',
+      content: prompt
+    });
+    
+    // Update the webview to show the user message
+    this._update();
+    
+    try {
+      // Get the current file content if available
+      let fileContent = '';
+      let fileName = '';
+      
+      // If we have a current file, use it
+      if (this._currentFile) {
+        fileContent = this._currentFile.content;
+        fileName = path.basename(this._currentFile.path);
+      }
+      
+      // Show loading indicator
+      this._panel.webview.postMessage({ 
+        command: 'loading', 
+        isLoading: true 
+      });
+      
+      // Call the API
+      const apiResponse = await callAgentApi(fileContent, fileName);
+      
+      // Format the response
+      const formattedResponse = formatApiResponse(apiResponse);
+      
+      // Add agent response to chat history
+      this._chatHistory.push({
+        role: 'agent',
+        content: formattedResponse
+      });
+      
+      // Send result to webview
+      this._panel.webview.postMessage({ 
+        command: 'response', 
+        text: formattedResponse,
+        isLoading: false
+      });
+      
+      // Update the webview
+      this._update();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      
+      // Add error to chat history
+      this._chatHistory.push({
+        role: 'agent',
+        content: `Error: ${errorMessage}`
+      });
+      
+      this._panel.webview.postMessage({ 
+        command: 'response', 
+        text: `Error: ${errorMessage}`,
+        isError: true,
+        isLoading: false
+      });
+      
+      // Update the webview
+      this._update();
+    }
+  }
+  
   private async handleExecuteCommand(message: any) {
     const prompt = message.prompt;
     const isDevAgentCommand = message.isDevAgentCommand;
@@ -523,7 +599,7 @@ export class ChatPanel {
     }
   }
   
-  private async executeCode(code: string, fileContent: string = '', fileName: string = '') {
+  private async executeCode(code: string, fileContent = '', fileName = '') {
     // Check if the code is a @dev-agent command
     if (code.startsWith('@dev-agent')) {
       const command = code.substring('@dev-agent'.length).trim();
@@ -531,16 +607,12 @@ export class ChatPanel {
     }
     
     // Otherwise, treat it as regular code to execute
-    try {
-      // If there's a current file, use it as input
-      if (fileContent && fileName) {
-        return await this.runAgentScript(code, 'custom', fileContent, fileName);
-      } else {
-        // No current file, just execute the code as is
-        return await this.runAgentScript(code, 'custom', '', '');
-      }
-    } catch (error) {
-      throw error;
+    // If there's a current file, use it as input
+    if (fileContent && fileName) {
+      return await this.runAgentScript(code, 'custom', fileContent, fileName);
+    } else {
+      // No current file, just execute the code as is
+      return await this.runAgentScript(code, 'custom', '', '');
     }
   }
   
@@ -1018,7 +1090,7 @@ export class ChatPanel {
                 
                 // Send message to extension
                 vscode.postMessage({
-                    command: 'execute',
+                    command: 'callApi',
                     prompt: prompt,
                     isDevAgentCommand: isDevAgentCommand
                 });
@@ -1079,6 +1151,63 @@ export class ChatPanel {
                         const fileName = message.filePath.split('/').pop();
                         currentFileName.textContent = fileName;
                         contextFilename.textContent = fileName;
+                        
+                        // Store file content in a data attribute for API calls
+                        contextDisplay.dataset.fileContent = message.fileContent;
+                        break;
+                    case 'loading':
+                        // Handle loading state
+                        if (message.isLoading) {
+                            // Add loading indicator
+                            const loadingElement = document.createElement('div');
+                            loadingElement.className = 'message-container agent loading-container';
+                            
+                            // Create header
+                            const headerDiv = document.createElement('div');
+                            headerDiv.className = 'message-header';
+                            
+                            const avatarDiv = document.createElement('div');
+                            avatarDiv.className = 'avatar';
+                            avatarDiv.textContent = 'A';
+                            
+                            const senderDiv = document.createElement('div');
+                            senderDiv.className = 'message-sender';
+                            senderDiv.textContent = 'Dev Agent';
+                            
+                            headerDiv.appendChild(avatarDiv);
+                            headerDiv.appendChild(senderDiv);
+                            
+                            // Create content
+                            const contentDiv = document.createElement('div');
+                            contentDiv.className = 'message-content';
+                            contentDiv.textContent = 'Processing your request... ';
+                            
+                            const loadingSpan = document.createElement('span');
+                            loadingSpan.className = 'loading';
+                            contentDiv.appendChild(loadingSpan);
+                            
+                            // Add to message
+                            loadingElement.appendChild(headerDiv);
+                            loadingElement.appendChild(contentDiv);
+                            
+                            // Add to chat
+                            chatContainer.appendChild(loadingElement);
+                            scrollToBottom();
+                            
+                            // Disable send button
+                            sendButton.disabled = true;
+                            sendButton.textContent = 'Processing...';
+                        } else {
+                            // Remove loading indicator
+                            const loadingElements = document.querySelectorAll('.loading-container');
+                            loadingElements.forEach(el => {
+                                chatContainer.removeChild(el);
+                            });
+                            
+                            // Enable send button
+                            sendButton.disabled = false;
+                            sendButton.textContent = 'Send';
+                        }
                         break;
                 }
             });
